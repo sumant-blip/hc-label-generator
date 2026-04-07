@@ -6,12 +6,11 @@ from reportlab.lib import colors
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-import io, os
+import io, os, re
 
 app = Flask(__name__)
 CORS(app)
 
-# ── Fonts
 try:
     pdfmetrics.registerFont(TTFont('DejaVuSans', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
     pdfmetrics.registerFont(TTFont('DejaVuSans-Bold', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'))
@@ -21,7 +20,6 @@ except:
     FONT_REG  = 'Helvetica'
     FONT_BOLD = 'Helvetica-Bold'
 
-# ── Brand
 HC_RED   = colors.HexColor("#c22126")
 HC_DARK  = colors.HexColor("#000000")
 HC_MID   = colors.HexColor("#333333")
@@ -33,6 +31,126 @@ MARGIN  = 8 * mm
 LABEL_W = (PAGE_W - 2 * MARGIN) / 2
 LABEL_H = (PAGE_H - 2 * MARGIN) / 2
 LOGO    = os.path.join(os.path.dirname(__file__), "logo.png")
+
+
+# ── SMART PARSER ──────────────────────────────────────────────────────────────
+
+def parse_orders(raw_text):
+    text = raw_text.strip()
+    order_pattern = r'(?=#\d{3,}|HSTLOFFLINE\d+|OFFLINE\d*|OFFSale)'
+    chunks = re.split(order_pattern, text)
+    chunks = [c.strip() for c in chunks if c.strip()]
+    orders = []
+    for chunk in chunks:
+        order = parse_single_order(chunk)
+        if order:
+            orders.append(order)
+    return orders
+
+
+def parse_single_order(chunk):
+    if not chunk:
+        return None
+
+    # Extract order ID
+    order_id_match = re.match(r'^(#\d+|HSTLOFFLINE\d+|OFFLINE\w*|OFFSale/[\w\-/]+)', chunk)
+    if not order_id_match:
+        return None
+    order_id = order_id_match.group(1)
+    rest = chunk[len(order_id):].strip()
+
+    # Extract phone
+    phone_match = re.search(r'(\+?91[\s\-]?\d{5}[\s\-]?\d{5}|\+?\d{10,12})', rest)
+    phone = phone_match.group(1).strip() if phone_match else ''
+    if phone_match:
+        rest = rest[:phone_match.start()] + ' ' + rest[phone_match.end():]
+
+    # Extract carrier
+    carrier = 'Tirupati'
+    carrier_match = re.search(r'(tirupati\s*surface|tirupati|shipmozo|air)', rest, re.IGNORECASE)
+    if carrier_match:
+        c_raw = carrier_match.group(1).lower()
+        carrier = 'Tirupati Surface' if 'surface' in c_raw else c_raw.title()
+        rest = rest[:carrier_match.start()] + ' ' + rest[carrier_match.end():]
+
+    # Extract size
+    size = 'One Size'
+    size_match = re.search(r'\b(UK\s*[\d.]+|FS|LL|One\s*Size|\d+\s*-\s*\d+\s*Days?)\b', rest, re.IGNORECASE)
+    if size_match:
+        size = size_match.group(1).strip()
+        rest = rest[:size_match.start()] + ' ' + rest[size_match.end():]
+
+    # Extract pincode
+    pin_match = re.search(r'(\d{6})', rest)
+    pincode = pin_match.group(1) if pin_match else ''
+
+    # Extract state
+    state_match = re.search(
+        r'(Maharashtra|Karnataka|Delhi|Rajasthan|Gujarat|Tamil Nadu|Telangana|'
+        r'Andhra Pradesh|West Bengal|Punjab|Haryana|Uttar Pradesh|Madhya Pradesh|'
+        r'Kerala|Bihar|Jharkhand|Odisha|Chandigarh|Goa|MH|KA|DL|RJ|GJ|TN|TG|AP|WB|PB|HR|UP|MP)',
+        rest, re.IGNORECASE)
+
+    # Build city_pin
+    city_pin = ''
+    if pin_match:
+        # Get text just before pincode as city name
+        before_pin = rest[:pin_match.start()].strip(' ,')
+        city_words = before_pin.split()[-3:] if before_pin else []
+        city = ' '.join(city_words).strip(' ,')
+        state = state_match.group(1) if state_match else ''
+        city_pin = f"{city}, {state} - {pincode}".strip(' ,-')
+        # Remove pincode and state from rest
+        rest = rest[:pin_match.start()] + rest[pin_match.end():]
+        if state_match:
+            rest = re.sub(state_match.group(1), '', rest, flags=re.IGNORECASE)
+
+    # Remove India
+    rest = re.sub(r'\bIndia\b', '', rest, flags=re.IGNORECASE)
+    rest = re.sub(r'\s{2,}', ' ', rest).strip(' ,')
+
+    # Split into: product name | recipient name | address
+    # Strategy: find a Title Case name pattern (First [Middle] Last)
+    name_pattern = re.search(
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z.]+){1,3})\s*,\s*(.+)',
+        rest
+    )
+
+    product_name = ''
+    recipient = ''
+    address = ''
+
+    if name_pattern:
+        product_name = rest[:name_pattern.start()].strip(' ,')
+        recipient = name_pattern.group(1).strip()
+        address = name_pattern.group(2).strip(' ,')
+    else:
+        # Fallback split
+        words = rest.split()
+        split_at = max(2, len(words) // 3)
+        product_name = ' '.join(words[:split_at])
+        remaining = ' '.join(words[split_at:])
+        rwords = remaining.split()
+        recipient = ' '.join(rwords[:3]) if len(rwords) >= 3 else remaining
+        address = ' '.join(rwords[3:]) if len(rwords) > 3 else ''
+
+    # Clean trailing city from address if city_pin already has it
+    address = re.sub(r',?\s*\d{6}\s*$', '', address).strip(' ,')
+
+    return {
+        'order_id': order_id,
+        'name': product_name.strip(' ,') or 'See order',
+        'size': size,
+        'ship_to': recipient.strip(' ,') or 'Customer',
+        'address': address.strip(' ,'),
+        'city_pin': city_pin,
+        'phone': phone,
+        'carrier': carrier,
+        'payment': 'PREPAID'
+    }
+
+
+# ── PDF GENERATION ─────────────────────────────────────────────────────────────
 
 def wrap_text(text, max_chars=46):
     if len(text) <= max_chars:
@@ -47,7 +165,6 @@ def draw_label(c, order, x, y):
 
     c.setFillColor(colors.white)
     c.roundRect(x+border, y+border, lw-2*border, lh-2*border, 2*mm, fill=1, stroke=0)
-
     c.setFillColor(HC_RED)
     c.rect(x+border, y+lh-border-1.5*mm, lw-2*border, 1.5*mm, fill=1, stroke=0)
 
@@ -66,7 +183,6 @@ def draw_label(c, order, x, y):
 
     c.setFillColor(HC_RED); c.setFont(FONT_BOLD, 6.5)
     c.drawString(x+border+pad, cur_y, "SHIP TO"); cur_y -= 4.5*mm
-
     c.setFillColor(HC_DARK); c.setFont(FONT_BOLD, 11)
     c.drawString(x+border+pad, cur_y, order["ship_to"]); cur_y -= 5.5*mm
 
@@ -74,7 +190,6 @@ def draw_label(c, order, x, y):
     for line in wrap_text(order["address"], 50):
         c.drawString(x+border+pad, cur_y, line); cur_y -= 4*mm
     c.drawString(x+border+pad, cur_y, order["city_pin"]); cur_y -= 4*mm
-
     c.setFillColor(HC_MID); c.setFont(FONT_REG, 8)
     c.drawString(x+border+pad, cur_y, "Ph: " + order["phone"]); cur_y -= 5.5*mm
 
@@ -83,28 +198,23 @@ def draw_label(c, order, x, y):
 
     c.setFillColor(HC_RED); c.setFont(FONT_BOLD, 6.5)
     c.drawString(x+border+pad, cur_y, "ITEM"); cur_y -= 4.5*mm
-
     c.setFillColor(HC_DARK); c.setFont(FONT_BOLD, 9)
     for line in wrap_text(order["name"], 46):
         c.drawString(x+border+pad, cur_y, line); cur_y -= 4.5*mm
 
     cur_y -= 1*mm
     badge_h = 6*mm; badge_w = 16*mm
-
-    # Size
     c.setStrokeColor(HC_RED); c.setFillColor(colors.white); c.setLineWidth(1)
     c.roundRect(x+border+pad, cur_y-mm, badge_w, badge_h, 1.5*mm, fill=1, stroke=1)
     c.setFillColor(HC_RED); c.setFont(FONT_BOLD, 8)
     c.drawCentredString(x+border+pad+badge_w/2, cur_y+1.5*mm, order["size"])
 
-    # FRAGILE
     fx = x+border+pad+badge_w+3*mm
     c.setStrokeColor(HC_AMBER); c.setFillColor(colors.white); c.setLineWidth(1)
     c.roundRect(fx, cur_y-mm, 18*mm, badge_h, 1.5*mm, fill=1, stroke=1)
     c.setFillColor(HC_AMBER); c.setFont(FONT_BOLD, 7.5)
     c.drawCentredString(fx+9*mm, cur_y+1.5*mm, "FRAGILE")
 
-    # PREPAID
     px = x+lw-border-pad-18*mm
     c.setStrokeColor(HC_GREEN); c.setFillColor(colors.white); c.setLineWidth(1)
     c.roundRect(px, cur_y-mm, 18*mm, badge_h, 1.5*mm, fill=1, stroke=1)
@@ -115,7 +225,6 @@ def draw_label(c, order, x, y):
     c.setFillColor(HC_MID); c.setFont(FONT_REG, 7)
     c.drawString(x+border+pad, cur_y, f"Carrier: {order.get('carrier', 'Tirupati')}"); cur_y -= 5*mm
 
-    # Barcode box
     bh = 18*mm; bw = lw-2*border-2*pad
     bx = x+border+pad; by = cur_y-bh
     c.setStrokeColor(colors.HexColor("#999999")); c.setLineWidth(0.6); c.setDash(3,3)
@@ -125,7 +234,6 @@ def draw_label(c, order, x, y):
     c.setFont(FONT_REG, 5.5)
     c.drawCentredString(bx+bw/2, by+bh/2-3*mm, "Tirupati / Shipmozo")
 
-    # Footer
     fh = 13*mm; fy = y+border
     c.setFillColor(colors.HexColor("#f0f0f0"))
     c.roundRect(x+border, fy, lw-2*border, fh, 2*mm, fill=1, stroke=0)
@@ -135,213 +243,206 @@ def draw_label(c, order, x, y):
     ry = fy+fh-4*mm
     c.drawString(x+border+4*mm, ry, "RETURN TO:"); ry -= 3.2*mm
     c.setFont(FONT_REG, 6.2); c.setFillColor(HC_MID)
-    for line in [
-        "HUSTLE CULTURE  |  hustleculture.co.in",
-        "12A Mandeville Garden, Flat 3D, 3rd Floor, Ballygunge",
-        "Kolkata - 700019, West Bengal  |  Ph: 6289021789"
-    ]:
+    for line in ["HUSTLE CULTURE  |  hustleculture.co.in",
+                 "12A Mandeville Garden, Flat 3D, 3rd Floor, Ballygunge",
+                 "Kolkata - 700019, West Bengal  |  Ph: 6289021789"]:
         c.drawString(x+border+4*mm, ry, line); ry -= 3*mm
-
     c.setStrokeColor(colors.HexColor("#888888")); c.setLineWidth(0.8)
     c.roundRect(x+border, y+border, lw-2*border, lh-2*border, 2*mm, fill=0, stroke=1)
 
 
-# ── HTML Frontend
+# ── HTML ───────────────────────────────────────────────────────────────────────
+
 HTML = '''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Hustle Culture · Label Generator</title>
+<title>HC Label Generator</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; background: #f4f4f2; min-height: 100vh; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --red: #c22126; --red-dark: #9e1a1e; --red-light: #fdf2f2;
+  --green: #1a7a3a; --amber: #c47000;
+  --black: #0d0d0d; --mid: #444; --grey: #777; --border: #e4e4e4;
+  --bg: #f7f6f4; --white: #fff; --beige: #fcf8c8;
+  --mono: 'DM Mono', monospace; --sans: 'DM Sans', sans-serif;
+}
+body { font-family: var(--sans); background: var(--bg); min-height: 100vh; color: var(--black); }
 
-  .header { background: #c22126; padding: 0 24px; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 12px rgba(194,33,38,0.25); }
-  .header-inner { max-width: 720px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; height: 56px; }
-  .logo-chip { background: #fcf8c8; border-radius: 4px; padding: 4px 9px; font-weight: 900; font-size: 13px; letter-spacing: 0.04em; color: #c22126; }
-  .header-title { color: rgba(255,255,255,0.65); font-size: 12px; letter-spacing: 0.1em; font-weight: 600; margin-left: 12px; }
-  .header-tag { color: rgba(255,255,255,0.45); font-size: 11px; }
+header {
+  background: var(--red); height: 60px; display: flex; align-items: center;
+  padding: 0 32px; position: sticky; top: 0; z-index: 100;
+  box-shadow: 0 2px 20px rgba(194,33,38,0.3);
+}
+.logo-pill { background: var(--beige); color: var(--red); font-weight: 700; font-size: 14px; letter-spacing: 0.06em; padding: 5px 11px; border-radius: 6px; }
+.hdiv { width: 1px; height: 20px; background: rgba(255,255,255,0.25); margin: 0 16px; }
+.htxt { color: rgba(255,255,255,0.7); font-size: 13px; letter-spacing: 0.08em; font-weight: 500; }
+.hbadge { margin-left: auto; background: rgba(255,255,255,0.12); color: rgba(255,255,255,0.55); font-size: 10px; letter-spacing: 0.1em; padding: 4px 10px; border-radius: 20px; font-family: var(--mono); }
 
-  .body { max-width: 720px; margin: 0 auto; padding: 28px 20px 80px; }
-  .hint { color: #777; font-size: 13px; margin-bottom: 24px; line-height: 1.5; }
+main { max-width: 740px; margin: 0 auto; padding: 48px 24px 80px; }
+h1 { font-size: 26px; font-weight: 700; margin-bottom: 8px; }
+.sub { color: var(--grey); font-size: 14px; line-height: 1.6; margin-bottom: 32px; }
+.sub strong { color: var(--mid); }
 
-  .card { background: #fff; border: 1px solid #e8e8e8; border-left: 3px solid #c22126; border-radius: 8px; padding: 20px; margin-bottom: 12px; }
-  .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-  .card-num { font-family: monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; color: #aaa; }
-  .remove-btn { background: none; border: none; cursor: pointer; color: #ccc; font-size: 22px; line-height: 1; padding: 0 4px; transition: color 0.15s; }
-  .remove-btn:hover { color: #c22126; }
+.input-card {
+  background: var(--white); border: 1.5px solid var(--border);
+  border-radius: 12px; overflow: hidden; margin-bottom: 16px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.input-card:focus-within { border-color: var(--red); box-shadow: 0 0 0 3px rgba(194,33,38,0.07); }
+.input-top {
+  display: flex; align-items: center; gap: 8px;
+  padding: 13px 16px 11px; border-bottom: 1px solid var(--border);
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
+.input-top-label { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; color: var(--grey); font-family: var(--mono); }
+textarea {
+  width: 100%; min-height: 200px; padding: 16px;
+  border: none; outline: none; font-family: var(--mono);
+  font-size: 12.5px; color: var(--black); background: transparent;
+  resize: vertical; line-height: 1.7;
+}
+textarea::placeholder { color: #bbb; }
 
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .span2 { grid-column: 1 / -1; }
-  label { display: block; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; color: #999; margin-bottom: 5px; }
-  input { width: 100%; border: 1px solid #e2e2e2; border-radius: 5px; padding: 9px 10px; font-size: 13px; color: #111; font-family: inherit; outline: none; background: #fafafa; transition: border-color 0.15s; }
-  input:focus { border-color: #c22126; background: #fff; }
+.preview-wrap { display: none; margin-bottom: 24px; }
+.preview-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.preview-lbl { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; color: var(--grey); font-family: var(--mono); }
+.preview-badge { background: var(--red); color: white; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 20px; font-family: var(--mono); }
+.preview-list { display: grid; gap: 6px; }
+.p-card {
+  background: var(--white); border: 1px solid var(--border);
+  border-left: 3px solid var(--red); border-radius: 8px;
+  padding: 11px 14px; display: flex; gap: 12px; align-items: start;
+}
+.p-id { font-family: var(--mono); font-size: 11px; color: var(--red); white-space: nowrap; padding-top: 2px; min-width: 90px; }
+.p-info { flex: 1; min-width: 0; }
+.p-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px; }
+.p-addr { font-size: 11px; color: var(--grey); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.p-size { font-family: var(--mono); font-size: 10px; background: var(--red-light); color: var(--red); padding: 3px 8px; border-radius: 4px; white-space: nowrap; font-weight: 500; align-self: flex-start; }
 
-  .tags { display: flex; gap: 6px; margin-top: 14px; flex-wrap: wrap; }
-  .tag { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; padding: 3px 9px; border-radius: 20px; background: #fff; }
+.error { background: var(--red-light); border: 1px solid rgba(194,33,38,0.2); border-radius: 8px; padding: 11px 14px; color: var(--red); font-size: 13px; margin-bottom: 14px; display: none; }
 
-  .add-btn { width: 100%; padding: 13px; background: transparent; border: 1.5px dashed #d0d0d0; border-radius: 8px; cursor: pointer; color: #bbb; font-size: 12px; font-weight: 700; letter-spacing: 0.07em; transition: all 0.15s; margin-bottom: 20px; font-family: inherit; }
-  .add-btn:hover { border-color: #c22126; color: #c22126; }
+.btn-row { display: flex; gap: 10px; }
+.btn-preview {
+  padding: 14px 20px; background: var(--white); border: 1.5px solid var(--border);
+  border-radius: 10px; cursor: pointer; font-family: var(--sans); font-size: 13px;
+  font-weight: 600; color: var(--mid); letter-spacing: 0.03em; transition: all 0.15s; white-space: nowrap;
+}
+.btn-preview:hover { border-color: var(--red); color: var(--red); }
+.btn-gen {
+  flex: 1; padding: 14px; background: var(--red); border: none; border-radius: 10px;
+  cursor: pointer; font-family: var(--sans); font-size: 13px; font-weight: 700;
+  color: white; letter-spacing: 0.06em; transition: all 0.2s;
+  box-shadow: 0 4px 16px rgba(194,33,38,0.28);
+}
+.btn-gen:hover { background: var(--red-dark); transform: translateY(-1px); }
+.btn-gen:disabled { background: #ccc; box-shadow: none; cursor: not-allowed; transform: none; }
+.btn-gen.ok { background: var(--green); }
 
-  .gen-btn { width: 100%; padding: 16px; background: #c22126; border: none; border-radius: 8px; cursor: pointer; color: #fff; font-size: 13px; font-weight: 700; letter-spacing: 0.1em; transition: background 0.2s; box-shadow: 0 4px 14px rgba(194,33,38,0.3); font-family: inherit; }
-  .gen-btn:hover { background: #a81b20; }
-  .gen-btn:disabled { background: #ccc; box-shadow: none; cursor: not-allowed; }
-  .gen-btn.success { background: #1a7a3a; box-shadow: 0 4px 14px rgba(26,122,58,0.3); }
-
-  .error-box { background: #fff3f3; border: 1px solid #f5c0c0; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #c22126; font-size: 13px; display: none; }
-  .hint-small { text-align: center; color: #bbb; font-size: 11px; margin-top: 8px; }
-  .footer { text-align: center; color: #ccc; font-size: 11px; margin-top: 40px; }
+footer { text-align: center; color: #bbb; font-size: 11px; margin-top: 48px; font-family: var(--mono); letter-spacing: 0.05em; }
 </style>
 </head>
 <body>
+<header>
+  <span class="logo-pill">HUSTLE</span>
+  <div class="hdiv"></div>
+  <span class="htxt">LABEL GENERATOR</span>
+  <span class="hbadge">INTERNAL OPS</span>
+</header>
 
-<div class="header">
-  <div class="header-inner">
-    <div style="display:flex;align-items:center">
-      <span class="logo-chip">HUSTLE</span>
-      <span class="header-title">LABEL GENERATOR</span>
+<main>
+  <h1>Generate shipping labels</h1>
+  <p class="sub">Paste raw order data below — <strong>one or multiple orders</strong>. The system parses and generates print-ready labels automatically.</p>
+
+  <div class="input-card">
+    <div class="input-top">
+      <div class="dot"></div>
+      <span class="input-top-label">PASTE ORDER DATA</span>
     </div>
-    <span class="header-tag">Internal Ops Tool</span>
+    <textarea id="inp" placeholder="#10001New Balance 9060 OlivineUK 9TirupatiRahul Sharma, 12 MG Road, Koramangala, 560034 Bangalore Karnataka, India, +91 98765 43210&#10;&#10;#10002Whoop 5.0 Coreknit Jet BlackFSTirupatiPriya Singh, 401 Sea View, Bandra West, 400050 Mumbai MH, +91 91234 56789"></textarea>
   </div>
-</div>
 
-<div class="body">
-  <p class="hint">Fill in order details below. Add multiple orders — PDF will be print-ready with 4 labels per A4 page.</p>
+  <div class="error" id="err"></div>
 
-  <div id="orders-container"></div>
-
-  <button class="add-btn" onclick="addOrder()">+ ADD ANOTHER ORDER</button>
-
-  <div class="error-box" id="error-box"></div>
-
-  <button class="gen-btn" id="gen-btn" onclick="generate()">GENERATE PDF · <span id="count">1</span> LABEL</button>
-  <p class="hint-small" id="hint-small" style="display:none">Fill all required fields to enable</p>
-
-  <p class="footer">hustleculture.co.in · Ops Tool</p>
-</div>
-
-<template id="card-template">
-  <div class="card" id="card-__IDX__">
-    <div class="card-header">
-      <span class="card-num">ORDER __NUM__ / <span class="total-count">1</span></span>
-      <button class="remove-btn" onclick="removeOrder(__IDX__)">×</button>
+  <div class="preview-wrap" id="pv">
+    <div class="preview-head">
+      <span class="preview-lbl">PARSED — REVIEW BEFORE GENERATING</span>
+      <span class="preview-badge" id="pv-count">0</span>
     </div>
-    <div class="grid">
-      <div><label>ORDER ID *</label><input type="text" placeholder="e.g. #10001 or HSTLOFFLINE0093" data-field="order_id"></div>
-      <div><label>SIZE</label><input type="text" placeholder="e.g. UK 9 / One Size / FS" data-field="size"></div>
-      <div class="span2"><label>ITEM NAME *</label><input type="text" placeholder="e.g. New Balance 9060 Olivine" data-field="name"></div>
-      <div><label>RECIPIENT NAME *</label><input type="text" placeholder="Full name" data-field="ship_to"></div>
-      <div><label>PHONE *</label><input type="text" placeholder="+91 XXXXX XXXXX" data-field="phone"></div>
-      <div class="span2"><label>ADDRESS *</label><input type="text" placeholder="Street, area, landmark" data-field="address"></div>
-      <div class="span2"><label>CITY – PIN *</label><input type="text" placeholder="e.g. Mumbai, Maharashtra – 400001" data-field="city_pin"></div>
-      <div><label>CARRIER</label><input type="text" placeholder="Tirupati" data-field="carrier" value="Tirupati"></div>
-      <div><label>PAYMENT TYPE</label><input type="text" placeholder="PREPAID" data-field="payment" value="PREPAID"></div>
-    </div>
-    <div class="tags">
-      <span class="tag" style="border:1px solid #555;color:#555">Tirupati</span>
-      <span class="tag" style="border:1px solid #1a7a3a;color:#1a7a3a">PREPAID</span>
-      <span class="tag" style="border:1px solid #c47000;color:#c47000">FRAGILE</span>
-    </div>
+    <div class="preview-list" id="pv-list"></div>
   </div>
-</template>
+
+  <div class="btn-row">
+    <button class="btn-preview" onclick="preview()">Preview</button>
+    <button class="btn-gen" id="gbtn" onclick="generate()">Generate PDF</button>
+  </div>
+
+  <footer>hustleculture.co.in &nbsp;·&nbsp; defaults: tirupati + prepaid</footer>
+</main>
 
 <script>
-let orderCount = 0;
-let orders = [];
+let parsed = [];
 
-function addOrder() {
-  const idx = orderCount++;
-  orders.push(idx);
-  const tmpl = document.getElementById('card-template').innerHTML
-    .replaceAll('__IDX__', idx)
-    .replaceAll('__NUM__', orders.length);
-  const wrapper = document.createElement('div');
-  wrapper.innerHTML = tmpl;
-  document.getElementById('orders-container').appendChild(wrapper.firstElementChild);
-  updateUI();
+async function preview() {
+  const raw = document.getElementById('inp').value.trim();
+  if (!raw) return err('Paste some order data first.');
+  clearErr();
+  const r = await fetch('/parse', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:raw}) });
+  const d = await r.json();
+  if (!d.orders?.length) return err('No orders found. Make sure order IDs start with # (e.g. #10001).');
+  parsed = d.orders;
+  showPreview(parsed);
 }
 
-function removeOrder(idx) {
-  orders = orders.filter(i => i !== idx);
-  document.getElementById('card-' + idx)?.remove();
-  updateUI();
-}
-
-function updateUI() {
-  const total = orders.length;
-  document.querySelectorAll('.total-count').forEach(el => el.textContent = total);
-  document.getElementById('count').textContent = total + ' LABEL' + (total !== 1 ? 'S' : '');
-  if (total === 0) addOrder();
-}
-
-function getOrders() {
-  return orders.map(idx => {
-    const card = document.getElementById('card-' + idx);
-    if (!card) return null;
-    const data = {};
-    card.querySelectorAll('[data-field]').forEach(input => {
-      data[input.dataset.field] = input.value.trim();
-    });
-    return data;
-  }).filter(Boolean);
-}
-
-function isValid(orders) {
-  return orders.every(o => o.order_id && o.name && o.ship_to && o.address && o.city_pin && o.phone);
+function showPreview(orders) {
+  document.getElementById('pv-count').textContent = orders.length + ' label' + (orders.length!==1?'s':'');
+  document.getElementById('pv-list').innerHTML = orders.map(o => `
+    <div class="p-card">
+      <div class="p-id">${o.order_id}</div>
+      <div class="p-info">
+        <div class="p-name">${o.name}</div>
+        <div class="p-addr">${o.ship_to} &middot; ${o.city_pin} &middot; ${o.phone}</div>
+      </div>
+      <div class="p-size">${o.size}</div>
+    </div>`).join('');
+  document.getElementById('pv').style.display = 'block';
 }
 
 async function generate() {
-  const btn = document.getElementById('gen-btn');
-  const errorBox = document.getElementById('error-box');
-  errorBox.style.display = 'none';
-
-  const data = getOrders();
-  if (!isValid(data)) {
-    errorBox.textContent = 'Please fill in all required fields (marked with *).';
-    errorBox.style.display = 'block';
-    return;
-  }
-
-  btn.disabled = true;
-  btn.textContent = 'GENERATING...';
+  const raw = document.getElementById('inp').value.trim();
+  if (!raw) return err('Paste some order data first.');
+  clearErr();
+  const btn = document.getElementById('gbtn');
+  btn.disabled = true; btn.textContent = 'GENERATING...';
 
   try {
-    const res = await fetch('/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ orders: data })
-    });
+    if (!parsed.length) {
+      const r = await fetch('/parse', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:raw}) });
+      const d = await r.json();
+      if (!d.orders?.length) { btn.disabled=false; btn.textContent='Generate PDF'; return err('No orders found.'); }
+      parsed = d.orders;
+      showPreview(parsed);
+    }
 
-    if (!res.ok) throw new Error('Server error');
-
+    const res = await fetch('/generate', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({orders:parsed}) });
+    if (!res.ok) throw new Error();
     const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url;
-    const date = new Date().toISOString().slice(0,10);
-    a.download = 'HC_Labels_' + date + '.pdf';
+    a.href = URL.createObjectURL(blob);
+    a.download = 'HC_Labels_' + new Date().toISOString().slice(0,10) + '.pdf';
     a.click();
-    URL.revokeObjectURL(url);
-
-    btn.classList.add('success');
-    btn.textContent = '✓ PDF DOWNLOADED';
-    setTimeout(() => {
-      btn.classList.remove('success');
-      btn.disabled = false;
-      btn.textContent = 'GENERATE PDF · ' + data.length + ' LABEL' + (data.length !== 1 ? 'S' : '');
-    }, 3000);
-
+    btn.classList.add('ok'); btn.textContent = '✓ PDF DOWNLOADED';
+    setTimeout(() => { btn.classList.remove('ok'); btn.disabled=false; btn.textContent='Generate PDF'; }, 3000);
   } catch(e) {
-    errorBox.textContent = 'Failed to generate PDF. Please try again.';
-    errorBox.style.display = 'block';
-    btn.disabled = false;
-    btn.textContent = 'GENERATE PDF · ' + data.length + ' LABEL' + (data.length !== 1 ? 'S' : '');
+    err('Generation failed. Try again.'); btn.disabled=false; btn.textContent='Generate PDF';
   }
 }
 
-// Init
-addOrder();
+function err(msg) { const b=document.getElementById('err'); b.textContent=msg; b.style.display='block'; }
+function clearErr() { document.getElementById('err').style.display='none'; }
+document.getElementById('inp').addEventListener('input', () => { parsed=[]; document.getElementById('pv').style.display='none'; });
 </script>
 </body>
 </html>'''
@@ -351,6 +452,12 @@ addOrder();
 def index():
     return render_template_string(HTML)
 
+@app.route('/parse', methods=['POST'])
+def parse_route():
+    text = request.json.get('text', '')
+    orders = parse_orders(text)
+    return jsonify({'orders': orders})
+
 @app.route('/generate', methods=['POST'])
 def generate():
     orders = request.json.get('orders', [])
@@ -359,24 +466,18 @@ def generate():
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-
     positions = [
-        (MARGIN, MARGIN + LABEL_H),
-        (MARGIN + LABEL_W, MARGIN + LABEL_H),
-        (MARGIN, MARGIN),
-        (MARGIN + LABEL_W, MARGIN),
+        (MARGIN, MARGIN + LABEL_H), (MARGIN + LABEL_W, MARGIN + LABEL_H),
+        (MARGIN, MARGIN), (MARGIN + LABEL_W, MARGIN),
     ]
-
     for i, order in enumerate(orders):
         if i % 4 == 0 and i != 0:
             c.showPage()
         draw_label(c, order, *positions[i % 4])
-
     c.save()
     buf.seek(0)
     return send_file(buf, mimetype='application/pdf',
-                     as_attachment=True,
-                     download_name='hustle_culture_labels.pdf')
+                     as_attachment=True, download_name='hustle_culture_labels.pdf')
 
 @app.route('/health')
 def health():
